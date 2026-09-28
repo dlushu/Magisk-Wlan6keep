@@ -1,4 +1,4 @@
-# wlan6keep — 熄屏保活 Wi-Fi IPv6（KernelSU / Magisk 模块）
+# Magisk-Wlan6keep — 熄屏保活 Wi-Fi IPv6（KernelSU / Magisk 模块）
 
 ColorOS / Android 熄屏后会丢掉 IPv6？本模块用「静态地址 + 事件驱动自愈」把它按住。
 
@@ -23,17 +23,16 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
 ## 逻辑结构（三层，各司其职）
 
 ```
-① 触发层   ip monitor address route（IPv4 + IPv6 的地址/路由事件）
+① 触发层   ip monitor link address route（链路 + IPv4/IPv6 的地址/路由事件）
               └─ 按接口名过滤 + 3 秒节流  →  调用 reconcile
 
 ② 收敛层   reconcile()：期望状态 = wlan0「有可用的全局 IPv6 + 有默认路由」
               ├─ iface_ready()      未连上 Wi-Fi → 直接返回
+              ├─ learn_gateway()    返回「换没换网关」→ 换了就拆地址 + 作废前缀（唯一判决）
               ├─ learn_prefix()     从 /proc 学真前缀（真地址优先，自建地址仅作候补）
-              ├─ learn_gateway()    有路由器信息 → 更新缓存
               ├─ real_global_v6()   系统已给真地址 → 拆掉多余静态地址，保留缓存 + 补路由
-              ├─ probe_ok()         只能吃缓存前缀 → 用该前缀的地址探测公网
-              │                     ├─ 通   → 补静态地址 + 路由（息屏救场）
-              │                     └─ 不通 → drop_self_addr() + forget_prefix()
+              ├─ 只能吃缓存前缀     → 补静态地址 + 路由（息屏救场）
+              │                     └─ probe_report() 只记录可达性，不参与判决
               └─ 都没有              → 绝不猜前缀，静待 RA
 
 ③ 支撑层   单职责小函数 + 日志
@@ -53,10 +52,14 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
   `learn_prefix()` 又会跳过模块自建的地址以「避免自我确认」；一旦自建地址成了 wlan0 上唯一的
   全局地址，就永远学不到前缀，只能一路退回硬编码值，把设备锁死在早已失效的旧前缀上。
   现在改成：前缀只从系统学到（包括从模块自己之前补的那个地址上读前缀），学不到就不补地址。
-- **用探测代替猜测**：缓存前缀是否还活着，只有一个可靠判据——拿它去 ping 一个公网 IPv6。
-  通就继续用（息屏收不到 RA 但前缀没变，正是模块要救的场景）；不通就说明 ISP 换了前缀，
-  立刻拆掉静态地址并忘掉该前缀。**宁可明确没有 IPv6，也不要留一个骗人的假地址**：假地址会让
-  `netcheck` 报 `v6os=true` 而实际 `v6=false`，Tailscale 会当成可用端点对外宣告，比没有还糟。
+- **作废前缀只由「确定性事件」触发**：网关（路由器）变了，就说明换了网络或换了路由器，
+  旧前缀必然不属于当前链路——此时才拆掉静态地址并作废前缀。**宁可明确没有 IPv6，也不要留
+  一个骗人的假地址**：假地址会让 `netcheck` 报 `v6os=true` 而实际 `v6=false`，Tailscale 会当成
+  可用端点对外宣告，比没有还糟。
+- **联网探测只写日志，不参与判决**：早期版本拿「用缓存前缀 ping 公网」当判据，不通就拆地址 +
+  忘前缀。实测这样反而把模块搞死了——探测失败的成因太多（息屏挂起丢包、刚补的地址还在 DAD、
+  系统那条 RA 默认路由已随地址一起消失……），一次误判就会删掉刚补好的地址、并永久忘记前缀，
+  从此再不工作。现在 `probe_report()` 只把可达性写进日志供排查，`PROBE_INTERVAL` 降级为纯节流。
 - **不在 `ip addr show` 与 `/proc` 之间比字符串**：两者的 IPv6 文本形式不同（内核会省掉每组的前导零，
   `908` 与 `0908` 是同一个前缀）。早期实现拿"从地址文本反推的前缀"和"从 /proc 分组得到的前缀"
   做等值比较，结果永远不相等，会陷入「删掉 → 补上 → 再删掉」的抖动。
@@ -70,7 +73,7 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
 ```sh
 # 方式一：用 KernelSU / Magisk 管理器安装 release 里的 zip
 # 方式二：克隆后自行打包
-zip -r wlan6keep.zip module.prop service.sh
+zip -r Magisk-Wlan6keep.zip module.prop service.sh
 ```
 
 安装后**重启生效**（模块在 `late_start` 阶段自动启动）。
@@ -85,12 +88,13 @@ zip -r wlan6keep.zip module.prop service.sh
 | `HOSTPART` | `8888` | 静态地址主机段 → `<prefix>::8888` |
 | `SELF_SUFFIX` | `:8888` | 从文本地址里认出模块自建地址用的后缀 |
 | `DEBOUNCE` | `3` | 事件节流窗口（秒） |
-| `PROBE_TARGET` | `2400:3200::1` | 前缀有效性探测目标（公网 IPv6，任何可用地址都行） |
-| `PROBE_COUNT` | `3` | 探测包数（单包会因链路偶发丢包误判） |
+| `PROBE_TARGET` | `2400:3200::1` | 探测目标（公网 IPv6，任何可用地址都行） |
+| `PROBE_COUNT` | `3` | 探测包数（单包会因链路偶发丢包，多打两个日志更可信） |
 | `PROBE_TIMEOUT` | `2` | 每个探测包的超时（秒） |
-| `PROBE_INTERVAL` | `300` | 探测通过后的信任期（秒），期间不再重复打网 |
+| `PROBE_INTERVAL` | `300` | 探测节流窗口（秒）：两次探测至少隔这么久，避免反复打外网 |
 
-不再有 `PREFIX_DEFAULT` / `GW_DEFAULT`：前缀只从系统学到，学不到就不补地址。
+不再有 `PREFIX_DEFAULT` / `GW_DEFAULT`：前缀只从系统学到，学不到就不补地址；
+前缀的作废只由「网关变化」触发，探测结果只写日志。
 
 ## 运行状态与日志
 
@@ -104,8 +108,9 @@ ip -6 addr show wlan0
 ip -6 route show table wlan0
 ```
 
-日志里出现的 `ADD addr …` / `ADD route …` 表示模块**补过一次**；`learn prefix` / `learn gateway`
-表示学到了新的前缀/网关；`offline -> drop cached prefix` 表示检测到掉线、旧前缀已作废。
+日志里出现的 `ADD addr …` / `ADD route …` 表示模块**补过一次**；`DEL addr …` 表示拆掉了静态
+地址（系统给了真地址，或换了网关）；`learn prefix` / `learn gateway` 表示学到了新的前缀/网关。
+`probe ok` / `probe failed` 只是把公网可达性记下来供排查，**不影响地址与前缀的去留**。
 
 ## 排查：模块与其他网络组件（如 Tailscale）冲突
 
@@ -124,20 +129,21 @@ su -c 'grep -c "monitor: RTM_NEWROUTE" /data/adb/tailscale/run/tailscaled.log'
 - 熄屏时系统的挂起优化依然存在（SLAAC 地址照旧会丢），模块只是用**静态地址**顶住；
 - **外部主动访问手机**：当对端邻居缓存过期、需要重新做 NDP 时可能失败（对方发的是组播 NS）；
   手机**主动出站**不受影响；
-- **换前缀后无法自愈到「有 IPv6」**：探测发现旧前缀已死会拆掉静态地址，但此后必须等系统
+- **换前缀后无法自愈到「有 IPv6」**：网关变化时会拆掉静态地址并作废前缀，但此后必须等系统
   重新收到 RA（亮屏 / Wi-Fi 重连）才会再学新前缀。Android 上没有 `ndisc6`/`rdisc6`，
   模块**没法主动发 RS 去催 RA**，这是当前最大短板；
+- **同一路由器上换 PD 前缀检测不到**：作废只由「网关变化」触发，若 ISP 在不换路由器的前提下
+  轮换了前缀，模块会继续用旧前缀补地址，直到网关变化或系统给出新 RA 才纠正；
 - **有些机型根本收不到 RA**（真机实测：一加 PLC110 / ColorOS）。`tcpdump -i wlan0` 抓 30 秒，
   来自其他主机的组播帧**一条都没有**（RA、mDNS、MLD 查询全无），本机自己发的组播能抓到——
   说明 Wi-Fi 固件只放行 solicited-node 组播（`33:33:ff:xx:xx:xx`），不放行通用 IPv6 组播
   `33:33:00:00:00:01`（`ff02::1`，RA 的目标地址）。这类机型**永远学不到 RA**，
   也就永远不会有 SLAAC 地址，静态地址是唯一的 IPv6 来源；
-  代价是前缀**只能靠缓存**，ISP 换前缀后模块会（正确地）拆掉死地址并忘掉前缀，
-  此后需要人工把新前缀写进 `state/prefix` + `state/prefix_hex` 才能恢复。
-  判断本机有没有这个毛病：`su -c 'ping6 -c 3 ff02::2%wlan0'`，
+  代价是前缀**只能靠缓存**，ISP 换前缀后需要人工把新前缀写进 `state/prefix` + `state/prefix_hex`
+  才能恢复。判断本机有没有这个毛病：`su -c 'ping6 -c 3 ff02::2%wlan0'`，
   若只回路由器而**从没出现过 SLAAC 地址**，基本就是了；
-- **检测有窗口**：探测受 `PROBE_INTERVAL` 节流，前缀变化后最长一个周期内可能仍在使用已失效的
-  前缀（此时表现为「有地址但出不去」）；
+- **换网关的检测有窗口**：网关缓存来自邻居表，邻居项会随 `gc_stale_time` 老化，
+  短时内可能读不到新网关，此时最长要等下一次网络事件才会纠正；
 - 无定时兜底：极端情况下（netlink 事件被内核丢弃）需等下一个事件触发。
 
 ## 许可

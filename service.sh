@@ -16,12 +16,17 @@
 #   实际一个包也出不去」的假地址（netcheck 表现为 v6os=true / v6=false）。
 #   Tailscale 会把这个假地址当成可用端点对外宣告，结果比「没有 IPv6」更糟——
 #   没有 IPv6 时它会干脆走 v4/DERP，有假 IPv6 时它会去试一条死路。
-#   所以这里用「联网探测」判定缓存前缀是否还活着，死了就立刻拆除退回无 IPv6。
+#   所以前缀缓存必须能作废，但作废只由「确定性事件」触发：网关（路由器）变了就说明
+#   换了网络或换了路由器，旧前缀必然不属于当前链路——此时立刻拆除地址并作废前缀。
+#   曾经用「联网探测失败即作废」来兜底，实测反而把模块搞死了：探测失败的成因太多
+#   （息屏挂起丢包、刚补的地址还在 DAD、系统那条 RA 路由已随地址一起消失……），
+#   一次误判就会删掉刚补好的地址、并永久忘记前缀，从此再不工作。
+#   现在联网探测只写日志，不参与判决。
 #
 # 逻辑结构（三层，各司其职，只在触发层做"什么时候做"，收敛层只描述"要什么"）：
 #   ① 触发层  订阅网络变化（link/address/route，IPv4+IPv6）→ 通知 reconcile
 #   ② 收敛层  reconcile()：把 wlan0 对齐到「有可用的全局 IPv6 + 有默认路由」
-#   ③ 支撑层  小函数：查询状态 / 学习缓存 / 校验前缀 / 补地址 / 补路由 / 日志
+#   ③ 支撑层  小函数：查询状态 / 学习缓存 / 探测记录 / 补地址 / 补路由 / 日志
 # ============================================================
 
 # ---------------- 配置 ----------------
@@ -33,12 +38,12 @@ mkdir -p "$STATE" 2>/dev/null
 IFACE=wlan0
 HOSTPART=8888                    # 静态地址主机段 → <prefix>::8888
 SELF_SUFFIX=":$HOSTPART"         # 用于在文本地址里认出模块自建的地址
-HOSTPART_HEX=$(printf '%016x' "$HOSTPART")   # 上者的 16 位十六进制，用于在 /proc 里认出它
+HOSTPART_HEX=$(printf '%016s' "$HOSTPART" | tr ' ' 0)   # 上者补齐成 16 位十六进制，用于在 /proc 里认出它
 DEBOUNCE=3                       # 事件节流窗口（秒）：同一批网络事件只收敛一次
-PROBE_TARGET=2400:3200::1        # 前缀有效性探测目标（公网 IPv6，任何可用地址都行）
-PROBE_COUNT=3                    # 探测包数：单包会因链路偶发丢包误判，多打两个更稳
+PROBE_TARGET=2400:3200::1        # 探测目标（公网 IPv6，任何可用地址都行）
+PROBE_COUNT=3                    # 探测包数：单包会因链路偶发丢包，多打两个日志更可信
 PROBE_TIMEOUT=2                  # 每个探测包的超时（秒）
-PROBE_INTERVAL=300               # 探测通过后的信任期（秒），期间不再重复打网
+PROBE_INTERVAL=300               # 探测节流窗口（秒）：两次探测至少隔这么久，避免反复打外网
 
 # ---------------- 日志 ----------------
 if [ -f "$LOG" ]; then
@@ -98,7 +103,7 @@ cached_prefix_hex() {
 # ---- 学习：把系统的真实信息缓存下来（有就记，没有就跳过） ----
 # 前缀优先级：系统（RA/SLAAC）给的地址 > 模块自建地址自带的前缀。
 #   前者是「刚亲眼看到系统在用这个前缀」，后者只是「这个地址当初被创建时的前缀」，
-#   仍然可能已经失效——所以它只配做候补，且必须经过 probe_ok() 验证才会被拿来补地址。
+#   仍然可能已经失效——所以它只配做候补；它的去留由网关变化（确定性事件）负责。
 #   （早期版本反过来：跳过自建地址以免"自我确认"，结果自建地址一旦成为 wlan0 上唯一的
 #   全局地址就永远学不到前缀，只能一路退回硬编码兜底，把设备锁死在旧前缀上。）
 learn_prefix() {
@@ -115,40 +120,45 @@ learn_prefix() {
   fi
   echo "$P" > "$STATE/prefix"
   echo "$H" > "$STATE/prefix_hex"
-  rm -f "$STATE/probe_ok_ts"        # 换了前缀 → 旧的探测结论作废
+  rm -f "$STATE/probe_ts"           # 换了前缀 → 让下次事件重新探测一次
   log "learn prefix: $P"
   return 0
 }
-# 网关：邻居表里带 router 标记的链路本地地址
+# 网关：邻居表里带 router 标记的链路本地地址。
+#   返回值是这里唯一的判决出口：0 = 没变 / 拿不到，1 = 换了网关（说明换了网络或换了路由器）
 learn_gateway() {
   G=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -w router | awk '{print $1}' | grep '^fe80:' | head -n1)
   [ -z "$G" ] && return 0
-  [ "$G" = "$(cat "$STATE/gateway" 2>/dev/null)" ] && return 0
+  OLD=$(cat "$STATE/gateway" 2>/dev/null)
+  [ "$G" = "$OLD" ] && return 0
   echo "$G" > "$STATE/gateway"
   log "learn gateway: $G"
-  return 0
+  [ -n "$OLD" ] && return 1    # 旧值非空且不同 → 确实换了网关
+  return 0                     # 首次记录（无旧值）→ 不算变化
 }
 
-# ---- 校验：缓存的前缀现在还活着吗 ----
-# 判据只有一个：用这个前缀里的静态地址去 ping 一个公网 IPv6。
-#   通   → 前缀仍然双向可达（哪怕当前收不到 RA，例如息屏组播被丢），可以继续用
-#   不通 → 前缀已经失效（典型：ISP 换了 PD 前缀 / 换了网络），必须立刻作废
-# 只有「系统没给真地址、只能吃缓存」时才会走到这里，所以不会常态化打网。
-probe_ok() {
+# ---- 探测：只记录可达性，不参与判决 ----
+# 用缓存前缀里的静态地址 ping 一个公网 IPv6，结果只写日志供排查。
+#   刻意不返回「前缀是否有效」：探测失败的成因太多（息屏挂起丢包、地址刚加还在 DAD、
+#   系统 RA 路由已随地址消失……），一旦拿它当判决，一次误判就会删掉好地址并作废前缀，
+#   反而让模块彻底失效。前缀去留只由 reconcile 里的确定性事件（网关变化）决定。
+#   PROBE_INTERVAL 现在只做节流：网络事件密集时不至于反复打外网。
+probe_report() {
   P=$(cached_prefix)
-  [ -z "$P" ] && return 1
+  [ -z "$P" ] && return 0
   NOW=$(date +%s)
-  LAST=$(cat "$STATE/probe_ok_ts" 2>/dev/null)
+  LAST=$(cat "$STATE/probe_ts" 2>/dev/null)
   if [ -n "$LAST" ] && [ $((NOW - LAST)) -lt "$PROBE_INTERVAL" ]; then
-    return 0                        # 上次探测通过且还在信任期内
+    return 0                        # 节流窗口内，不重复打网
   fi
+  echo "$NOW" > "$STATE/probe_ts"
   A="${P}${HOSTPART}"
   if ping6 -c "$PROBE_COUNT" -W "$PROBE_TIMEOUT" -I "$A" "$PROBE_TARGET" >/dev/null 2>&1; then
-    echo "$NOW" > "$STATE/probe_ok_ts"
-    return 0
+    log "probe ok for cached prefix $P"
+  else
+    log "probe failed for cached prefix $P (仅记录，不影响地址与前缀)"
   fi
-  log "probe FAILED for cached prefix $P"
-  return 1
+  return 0
 }
 
 # ---- 对齐：缺什么补什么（幂等，重复调用结果一致） ----
@@ -163,7 +173,9 @@ ensure_addr_from() {
         '$6==d && index($1,k)==1 {found=1} END{exit !found}' \
         /proc/net/if_inet6 2>/dev/null && return 0
   fi
-  ip -6 addr add "${P}${HOSTPART}/64" dev "$IFACE" 2>/dev/null \
+  # nodad 必须加：否则新地址在 DAD 完成前是 tentative，紧接着的 probe_report
+  # 会立刻 "Cannot assign requested address" 失败，日志里全是假失败、看不出真实可达性。
+  ip -6 addr add "${P}${HOSTPART}/64" dev "$IFACE" nodad 2>/dev/null \
     && log "ADD addr ${P}${HOSTPART}"
   return 0
 }
@@ -194,7 +206,7 @@ ensure_route() {
 
 # ---- 拆除：把模块自建的全部地址和它们的前缀路由清掉（不碰 state/） ----
 # 拆的是「地址」这个动作，缓存前缀的去留由调用方决定：
-#   探测失败 → 前缀已证伪，调用方会连缓存一起清掉；
+#   网关变化 → 前缀已确证不属于当前链路，调用方会连缓存一起清掉；
 #   系统已给真地址 → 缓存里是真前缀，要留着以后用。
 drop_self_addr() {
   self_addrs | while read -r A; do
@@ -207,7 +219,7 @@ drop_self_addr() {
 
 # ---- 作废缓存前缀 ----
 forget_prefix() {
-  rm -f "$STATE/prefix" "$STATE/prefix_hex" "$STATE/probe_ok_ts"
+  rm -f "$STATE/prefix" "$STATE/prefix_hex" "$STATE/probe_ts"
   return 0
 }
 
@@ -216,15 +228,21 @@ forget_prefix() {
 #    期望状态就是下面这几行的字面意思；函数幂等，随时调用都安全
 # ============================================================
 reconcile() {
-  iface_ready || return 0       # 没连上 Wi-Fi → 什么都不做（旧缓存留着，重连后要校验）
-  learn_prefix                  # 有真实前缀 → 更新缓存
-  learn_gateway                 # 有路由器信息 → 更新缓存
+  iface_ready || return 0       # 没连上 Wi-Fi → 什么都不做（旧缓存留着，重连后再判）
+
+  # 唯一的作废判据：网关变了 = 换了路由器/换了网络 → 旧前缀必然不属于当前链路，
+  # 先拆干净再重新学。放在 learn_prefix 之前，避免刚学到的新前缀又被下面清掉。
+  if ! learn_gateway; then
+    drop_self_addr
+    forget_prefix
+  fi
+  learn_prefix                  # 有真实前缀 → 更新缓存（换网后这里会写入新前缀）
 
   # ① 系统已经给了真地址（RA/SLAAC）→ 最理想，模块的静态地址是多余的，拆掉
   #    拆之前 learn_prefix 已经把真前缀写进缓存，所以这里只清「地址」，保留缓存
   if [ -n "$(real_global_v6)" ]; then
     drop_self_addr
-    rm -f "$STATE/probe_ok_ts"
+    rm -f "$STATE/probe_ts"
     ensure_route
     return 0
   fi
@@ -233,15 +251,9 @@ reconcile() {
   P=$(cached_prefix)
   if [ -n "$P" ]; then
     ensure_addr_from "$P"
-    if probe_ok; then
-      ensure_route
-    else
-      # 前缀已被证伪（典型：ISP 换了 PD 前缀）→ 拆掉地址并忘掉前缀，
-      # 避免「补上 → 探测失败 → 拆掉 → 下个事件又补上」的抖动。
-      # 宁可明确「没有 IPv6」，也不要留一个骗人的假地址。
-      drop_self_addr
-      forget_prefix
-    fi
+    # 先补路由再探测：没有默认路由时 ping 连包都发不出去，日志只会是假失败
+    ensure_route
+    probe_report                # 只记录可达性，地址与前缀的去留不受它影响
     return 0
   fi
 
