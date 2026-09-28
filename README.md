@@ -25,6 +25,8 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
 ```
 ① 触发层   ip monitor link address route（链路 + IPv4/IPv6 的地址/路由事件）
               └─ 按接口名过滤 + 3 秒节流  →  调用 reconcile
+              └─ MONITOR_WINDOW 周期兜底：单次监听最长 60 秒，到点主动断开重连，
+                 即使 netlink 事件被丢掉，也会周期性醒来收敛一次
 
 ② 收敛层   reconcile()：期望状态 = wlan0「有可用的全局 IPv6 + 有默认路由」
               ├─ iface_ready()      未连上 Wi-Fi → 直接返回
@@ -45,6 +47,13 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
   因此改为「订阅全部事件 + 按接口名过滤」。
 - **监听不带 `-6`**：同时订阅 IPv4 事件。手机连上 Wi-Fi 时通常是**先拿到 IPv4、之后才有 RA**；
   若只听 IPv6，则「刚连上 Wi-Fi 且收不到 RA」时根本没有任何事件能唤醒模块。
+- **`ip` / `ping6` 一律用绝对路径**：KernelSU 用 `ASH_STANDALONE=1 /data/adb/ksu/bin/busybox
+  sh service.sh` 拉起本脚本，而 busybox sh 的 standalone 模式会**优先命中它自带的 applet**——
+  `ip` 被解析成 busybox 的精简实现，**即使 `PATH` 里明明有 `/system/bin/ip` 也一样被遮蔽**（实测
+  确认）。由此引出两个静默故障：`ip monitor` 没有这个子命令 → 秒退，主循环退化成每 5 秒空转；
+  `ip -6 addr add … nodad` 不认 `nodad` → 报 `'nodad' is garbage` 后失败，若被 `2>/dev/null` 吞掉，
+  地址就永远补不上、日志里只剩 `probe failed`。所以脚本里用 `IP=/system/bin/ip`、
+  `PING6=/system/bin/ping6` 两个常量，所有调用走绝对路径（绝对路径不参与 applet 匹配）。
 - **`ensure_route()` 先查后写**：若无条件执行 `ip route replace`，内核每次都会广播
   `RTM_NEWROUTE`；而模块自己也监听 route 事件 → 形成**自激循环**，持续抖动路由表。
   这曾导致 **Tailscale 端点发现被反复打断、只能走 DERP 中继无法直连**，务必保持「先查后写」。
@@ -92,6 +101,7 @@ zip -r Magisk-Wlan6keep.zip module.prop service.sh
 | `PROBE_COUNT` | `3` | 探测包数（单包会因链路偶发丢包，多打两个日志更可信） |
 | `PROBE_TIMEOUT` | `2` | 每个探测包的超时（秒） |
 | `PROBE_INTERVAL` | `300` | 探测节流窗口（秒）：两次探测至少隔这么久，避免反复打外网 |
+| `MONITOR_WINDOW` | `60` | 单次监听的最长时间（秒）：到点主动断开重连，作为「事件丢了」的周期兜底 |
 
 不再有 `PREFIX_DEFAULT` / `GW_DEFAULT`：前缀只从系统学到，学不到就不补地址；
 前缀的作废只由「网关变化」触发，探测结果只写日志。
@@ -144,7 +154,8 @@ su -c 'grep -c "monitor: RTM_NEWROUTE" /data/adb/tailscale/run/tailscaled.log'
   若只回路由器而**从没出现过 SLAAC 地址**，基本就是了；
 - **换网关的检测有窗口**：网关缓存来自邻居表，邻居项会随 `gc_stale_time` 老化，
   短时内可能读不到新网关，此时最长要等下一次网络事件才会纠正；
-- 无定时兜底：极端情况下（netlink 事件被内核丢弃）需等下一个事件触发。
+- **兜底是周期性的，但不是即时的**：`MONITOR_WINDOW`（默认 60 秒）会在没有事件时主动重连监听并
+  收敛一次，覆盖「netlink 事件被内核丢弃」的极端情况；但收敛最快也要等这一个窗口，不是秒级。
 
 ## 许可
 

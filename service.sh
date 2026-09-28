@@ -25,6 +25,7 @@
 #
 # 逻辑结构（三层，各司其职，只在触发层做"什么时候做"，收敛层只描述"要什么"）：
 #   ① 触发层  订阅网络变化（link/address/route，IPv4+IPv6）→ 通知 reconcile
+#              （外加 MONITOR_WINDOW 兜底：没事件也会周期性醒来收敛一次）
 #   ② 收敛层  reconcile()：把 wlan0 对齐到「有可用的全局 IPv6 + 有默认路由」
 #   ③ 支撑层  小函数：查询状态 / 学习缓存 / 探测记录 / 补地址 / 补路由 / 日志
 # ============================================================
@@ -44,6 +45,16 @@ PROBE_TARGET=2400:3200::1        # 探测目标（公网 IPv6，任何可用地�
 PROBE_COUNT=3                    # 探测包数：单包会因链路偶发丢包，多打两个日志更可信
 PROBE_TIMEOUT=2                  # 每个探测包的超时（秒）
 PROBE_INTERVAL=300               # 探测节流窗口（秒）：两次探测至少隔这么久，避免反复打外网
+MONITOR_WINDOW=60                # 单次监听的最长时间（秒）：到点主动断开重连，作为"事件丢了"的兜底
+
+# KernelSU 用 `ASH_STANDALONE=1 /data/adb/ksu/bin/busybox sh service.sh` 拉起本脚本，
+# 而 busybox sh 的 standalone 模式会**优先命中它自带的 applet**：`ip` 被解析成 busybox 的
+# 精简 ip 实现，即使 PATH 里明明有 /system/bin/ip 也一样被遮蔽（实测确认）。后果是两个
+# 静默故障：`ip monitor` 没有这个子命令 → 秒退，主循环退化成每 5 秒空转；`ip -6 addr add`
+# 不认 `nodad` → 报 "'nodad' is garbage" 后失败，被 2>/dev/null 吞掉，地址永远补不上。
+# 所以这里所有 ip / ping6 一律用绝对路径调用（绝对路径不参与 applet 匹配）。
+IP=/system/bin/ip
+PING6=/system/bin/ping6
 
 # ---------------- 日志 ----------------
 if [ -f "$LOG" ]; then
@@ -68,18 +79,18 @@ log "=== service start (boot_completed=$(getprop sys.boot_completed)) ==="
 # ---- 状态查询 ----
 # Wi-Fi 是否已连上（已拿到 IPv4）：没连上时后面的动作都没有意义
 iface_ready() {
-  ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q 'inet '
+  $IP -4 addr show dev "$IFACE" 2>/dev/null | grep -q 'inet '
 }
 # 系统（RA/SLAAC）给的全局地址。判据是关键字 dynamic：
 #   SLAAC/临时地址一律带 dynamic，而模块用 `ip addr add` 补的地址不带。
 #   这比「按主机段 :8888 猜」可靠得多——按主机段猜会误伤真实地址恰好以 ::8888 结尾的情况。
 real_global_v6() {
-  ip -6 addr show dev "$IFACE" scope global 2>/dev/null \
+  $IP -6 addr show dev "$IFACE" scope global 2>/dev/null \
     | awk '/inet6/ && /dynamic/ {print $2}'
 }
 # 模块自建的全部地址（形如 <prefix>::8888/64）：非 dynamic + 主机段匹配，与前缀无关
 self_addrs() {
-  ip -6 addr show dev "$IFACE" scope global 2>/dev/null \
+  $IP -6 addr show dev "$IFACE" scope global 2>/dev/null \
     | awk -v s="$SELF_SUFFIX" '
         /inet6/ && !/dynamic/ {
           split($2, a, "/")
@@ -127,7 +138,7 @@ learn_prefix() {
 # 网关：邻居表里带 router 标记的链路本地地址。
 #   返回值是这里唯一的判决出口：0 = 没变 / 拿不到，1 = 换了网关（说明换了网络或换了路由器）
 learn_gateway() {
-  G=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -w router | awk '{print $1}' | grep '^fe80:' | head -n1)
+  G=$($IP -6 neigh show dev "$IFACE" 2>/dev/null | grep -w router | awk '{print $1}' | grep '^fe80:' | head -n1)
   [ -z "$G" ] && return 0
   OLD=$(cat "$STATE/gateway" 2>/dev/null)
   [ "$G" = "$OLD" ] && return 0
@@ -153,10 +164,11 @@ probe_report() {
   fi
   echo "$NOW" > "$STATE/probe_ts"
   A="${P}${HOSTPART}"
-  if ping6 -c "$PROBE_COUNT" -W "$PROBE_TIMEOUT" -I "$A" "$PROBE_TARGET" >/dev/null 2>&1; then
+  OUT=$($PING6 -c "$PROBE_COUNT" -W "$PROBE_TIMEOUT" -I "$A" "$PROBE_TARGET" 2>&1); RC=$?
+  if [ "$RC" -eq 0 ]; then
     log "probe ok for cached prefix $P"
   else
-    log "probe failed for cached prefix $P (仅记录，不影响地址与前缀)"
+    log "probe failed (rc=$RC) for cached prefix $P (仅记录，不影响地址与前缀)"
   fi
   return 0
 }
@@ -175,8 +187,14 @@ ensure_addr_from() {
   fi
   # nodad 必须加：否则新地址在 DAD 完成前是 tentative，紧接着的 probe_report
   # 会立刻 "Cannot assign requested address" 失败，日志里全是假失败、看不出真实可达性。
-  ip -6 addr add "${P}${HOSTPART}/64" dev "$IFACE" nodad 2>/dev/null \
-    && log "ADD addr ${P}${HOSTPART}"
+  # 失败必须落日志：这一处曾经因为 `2>/dev/null` 把 busybox ip 不认 nodad 的报错吞掉，
+  # 结果地址永远补不上、表面上只剩 "probe failed"，排查了很久。
+  OUT=$($IP -6 addr add "${P}${HOSTPART}/64" dev "$IFACE" nodad 2>&1); RC=$?
+  if [ "$RC" -eq 0 ]; then
+    log "ADD addr ${P}${HOSTPART}"
+  else
+    log "ADD addr FAILED (rc=$RC): $OUT"
+  fi
   return 0
 }
 ensure_route() {
@@ -188,18 +206,24 @@ ensure_route() {
   # 无条件 replace 会让内核每次都广播 RTM_NEWROUTE，而本模块自己也监听 route 事件，
   # 于是形成"自己触发自己"的自激循环，持续抖动路由表（会打断 Tailscale 等组件的
   # 端点发现）。所以这里改为先查后写。
-  if ! ip -6 route show "${P}/64" dev "$IFACE" table "$IFACE" 2>/dev/null | grep -q .; then
-    ip -6 route add "${P}/64" dev "$IFACE" table "$IFACE" 2>/dev/null
+  if ! $IP -6 route show "${P}/64" dev "$IFACE" table "$IFACE" 2>/dev/null | grep -q .; then
+    OUT=$($IP -6 route add "${P}/64" dev "$IFACE" table "$IFACE" 2>&1) \
+      || log "ADD route ${P}/64 (table $IFACE) FAILED: $OUT"
   fi
 
   [ -z "$G" ] && return 0
 
-  if ! ip -6 route show default dev "$IFACE" table "$IFACE" 2>/dev/null | grep -q "via $G"; then
-    ip -6 route add default via "$G" dev "$IFACE" table "$IFACE" 2>/dev/null \
-      && log "ADD route default via $G (table $IFACE)"
+  if ! $IP -6 route show default dev "$IFACE" table "$IFACE" 2>/dev/null | grep -q "via $G"; then
+    OUT=$($IP -6 route add default via "$G" dev "$IFACE" table "$IFACE" 2>&1)
+    if [ $? -eq 0 ]; then
+      log "ADD route default via $G (table $IFACE)"
+    else
+      log "ADD route default (table $IFACE) FAILED: $OUT"
+    fi
   fi
-  if ! ip -6 route show default dev "$IFACE" 2>/dev/null | grep -q "via $G"; then
-    ip -6 route add default via "$G" dev "$IFACE" 2>/dev/null
+  if ! $IP -6 route show default dev "$IFACE" 2>/dev/null | grep -q "via $G"; then
+    OUT=$($IP -6 route add default via "$G" dev "$IFACE" 2>&1) \
+      || log "ADD route default (main) FAILED: $OUT"
   fi
   return 0
 }
@@ -211,8 +235,8 @@ ensure_route() {
 drop_self_addr() {
   self_addrs | while read -r A; do
     [ -z "$A" ] && continue
-    ip -6 addr del "$A" dev "$IFACE" 2>/dev/null && log "DEL addr $A"
-    ip -6 route del "$(prefix_of_addr "$A")/64" dev "$IFACE" table "$IFACE" 2>/dev/null
+    $IP -6 addr del "$A" dev "$IFACE" 2>/dev/null && log "DEL addr $A"
+    $IP -6 route del "$(prefix_of_addr "$A")/64" dev "$IFACE" table "$IFACE" 2>/dev/null
   done
   return 0
 }
@@ -283,8 +307,11 @@ on_network_change() {
 LAST_ACT=0
 while true; do
   reconcile                                             # 开始监听前先对齐一次
-  ip monitor link address route 2>/dev/null | while read -r evt; do
+  # timeout：到点主动断开监听、重连一次。netlink 事件偶尔会丢（内核队列溢出/驱动异常），
+  #   只靠事件驱动的话丢了就一直卡住；这里保证「无论有没有事件，至少每 $MONITOR_WINDOW 秒
+  #   收敛一次」。reconcile 幂等且先查后写，状态正常时这一趟不产生任何写操作。
+  timeout "$MONITOR_WINDOW" $IP monitor link address route 2>/dev/null | while read -r evt; do
     on_network_change "$evt"
   done
-  sleep 5                                               # 监听中断 → 稍后重连
+  sleep 2                                               # 监听中断 → 稍后重连
 done
