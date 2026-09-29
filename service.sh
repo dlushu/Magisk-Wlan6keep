@@ -16,12 +16,14 @@
 #   实际一个包也出不去」的假地址（netcheck 表现为 v6os=true / v6=false）。
 #   Tailscale 会把这个假地址当成可用端点对外宣告，结果比「没有 IPv6」更糟——
 #   没有 IPv6 时它会干脆走 v4/DERP，有假 IPv6 时它会去试一条死路。
-#   所以前缀缓存必须能作废，但作废只由「确定性事件」触发：网关（路由器）变了就说明
-#   换了网络或换了路由器，旧前缀必然不属于当前链路——此时立刻拆除地址并作废前缀。
-#   曾经用「联网探测失败即作废」来兜底，实测反而把模块搞死了：探测失败的成因太多
-#   （息屏挂起丢包、刚补的地址还在 DAD、系统那条 RA 路由已随地址一起消失……），
-#   一次误判就会删掉刚补好的地址、并永久忘记前缀，从此再不工作。
-#   现在联网探测只写日志，不参与判决。
+#   所以前缀缓存必须能作废。作废有两类判据，都要求「强证据」：
+#   ① 确定性事件：网关（路由器）变了 = 换了网络或换了路由器，旧前缀必然不属于当前链路，
+#      立刻拆地址 + 作废前缀；
+#   ② 保守失效判定：连续 N 次联网探测失败、且这串失败跨越足够长时间（默认 3 次 / 15 分钟），
+#      说明「网关没变但 ISP 换了 PD 前缀」——此时地址看着还在、实际一个包也出不去。
+#   为什么不拿单次探测失败判死：探测失败的成因太多（息屏挂起丢包、刚补的地址还在 DAD、
+#   系统那条 RA 路由已随地址一起消失……），一次误判就会删掉刚补好的地址、并永久忘记前缀，
+#   从此再不工作。所以单次失败只写日志、只累积证据，且地址刚补上时有一段观察期不计入。
 #
 # 逻辑结构（三层，各司其职，只在触发层做"什么时候做"，收敛层只描述"要什么"）：
 #   ① 触发层  订阅网络变化（link/address/route，IPv4+IPv6）→ 通知 reconcile
@@ -46,6 +48,9 @@ PROBE_COUNT=3                    # 探测包数：单包会因链路偶发丢包
 PROBE_TIMEOUT=2                  # 每个探测包的超时（秒）
 PROBE_INTERVAL=300               # 探测节流窗口（秒）：两次探测至少隔这么久，避免反复打外网
 MONITOR_WINDOW=60                # 单次监听的最长时间（秒）：到点主动断开重连，作为"事件丢了"的兜底
+PROBE_FAIL_LIMIT=3               # 保守失效判定：连续失败达到这个次数才考虑判死（单次失败绝不判死）
+PROBE_FAIL_WINDOW=900            # 保守失效判定：这串失败还必须跨越这么久（秒），避免踩到一段短时抖动
+ADDR_GRACE=60                    # 地址刚补上后的观察期（秒）：期间探测失败不计入（DAD/路由未就绪）
 
 # KernelSU 用 `ASH_STANDALONE=1 /data/adb/ksu/bin/busybox sh service.sh` 拉起本脚本，
 # 而 busybox sh 的 standalone 模式会**优先命中它自带的 applet**：`ip` 被解析成 busybox 的
@@ -131,7 +136,7 @@ learn_prefix() {
   fi
   echo "$P" > "$STATE/prefix"
   echo "$H" > "$STATE/prefix_hex"
-  rm -f "$STATE/probe_ts"           # 换了前缀 → 让下次事件重新探测一次
+  rm -f "$STATE/probe_ts" "$STATE/probe_fail_cnt" "$STATE/probe_fail_since"   # 换了前缀 → 重新探测、失败证据清零
   log "learn prefix: $P"
   return 0
 }
@@ -148,12 +153,14 @@ learn_gateway() {
   return 0                     # 首次记录（无旧值）→ 不算变化
 }
 
-# ---- 探测：只记录可达性，不参与判决 ----
-# 用缓存前缀里的静态地址 ping 一个公网 IPv6，结果只写日志供排查。
-#   刻意不返回「前缀是否有效」：探测失败的成因太多（息屏挂起丢包、地址刚加还在 DAD、
-#   系统 RA 路由已随地址消失……），一旦拿它当判决，一次误判就会删掉好地址并作废前缀，
-#   反而让模块彻底失效。前缀去留只由 reconcile 里的确定性事件（网关变化）决定。
-#   PROBE_INTERVAL 现在只做节流：网络事件密集时不至于反复打外网。
+# ---- 探测：收集可达性证据（单次失败不判决，只累积证据） ----
+# 用缓存前缀里的静态地址 ping 一个公网 IPv6。
+#   单次失败刻意不参与判决：失败成因太多（息屏挂起丢包、地址刚加还在 DAD、系统 RA 路由已随
+#   地址消失……），一旦拿它当判决，一次误判就会删掉好地址并作废前缀，反而让模块彻底失效。
+#   但完全不判决也有代价：网关没变、ISP 换了前缀时，模块会一直拿旧前缀补地址，得到一个
+#   「看着有 IPv6、实际一个包也出不去」的假地址（比没有更糟，Tailscale 会照 Declare 出去）。
+#   折中：失败只写日志 + 累积证据；只有「连续 N 次失败 且 这串失败跨越 T 时间」这种强证据
+#   才由 probe_verdict 判死，交给 reconcile 拆地址 + 作废前缀。
 probe_report() {
   P=$(cached_prefix)
   [ -z "$P" ] && return 0
@@ -167,13 +174,46 @@ probe_report() {
   OUT=$($PING6 -c "$PROBE_COUNT" -W "$PROBE_TIMEOUT" -I "$A" "$PROBE_TARGET" 2>&1); RC=$?
   if [ "$RC" -eq 0 ]; then
     log "probe ok for cached prefix $P"
-  else
-    log "probe failed (rc=$RC) for cached prefix $P (仅记录，不影响地址与前缀)"
+    rm -f "$STATE/probe_fail_cnt" "$STATE/probe_fail_since"   # 通了 → 证据清零
+    return 0
   fi
+  # 地址刚补上（或刚开机补上）时的失败不算证据：多半是暂时状态，不是前缀的问题
+  ADDED=$(cat "$STATE/addr_added_ts" 2>/dev/null)
+  if [ -n "$ADDED" ] && [ $((NOW - ADDED)) -lt "$ADDR_GRACE" ]; then
+    log "probe failed (rc=$RC) but ignored: address added $((NOW - ADDED))s ago (within grace)"
+    return 0
+  fi
+  CNT=$(cat "$STATE/probe_fail_cnt" 2>/dev/null)
+  case "$CNT" in ''|*[!0-9]*) CNT=0 ;; esac
+  if [ "$CNT" -eq 0 ]; then
+    echo "$NOW" > "$STATE/probe_fail_since"   # 这串失败从这一刻算起
+  fi
+  echo $((CNT + 1)) > "$STATE/probe_fail_cnt"
+  log "probe failed (rc=$RC) for cached prefix $P (streak $((CNT + 1))/$PROBE_FAIL_LIMIT)"
   return 0
 }
 
+# ---- 判决：只有强证据才认定缓存前缀已死（返回 1 = 已死） ----
+# 判据：连续失败次数达标，且这串失败跨越的时间也达标。两个条件缺一不可——
+#   只看次数：短时抖动（连续几次丢包）就会误杀；
+#   只看时长：一次失败挂很久也会误杀。
+# 通过后由 reconcile 拆地址 + 作废前缀，模块回到「没有 IPv6」的诚实状态，等待新 RA/人工恢复。
+probe_verdict() {
+  CNT=$(cat "$STATE/probe_fail_cnt" 2>/dev/null)
+  case "$CNT" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$CNT" -lt "$PROBE_FAIL_LIMIT" ] && return 0
+  SINCE=$(cat "$STATE/probe_fail_since" 2>/dev/null)
+  case "$SINCE" in ''|*[!0-9]*) return 0 ;; esac
+  NOW=$(date +%s)
+  [ $((NOW - SINCE)) -lt "$PROBE_FAIL_WINDOW" ] && return 0
+  log "verdict: prefix $(cached_prefix) looks dead (probe failed $CNT times over $((NOW - SINCE))s) → drop addr and forget prefix"
+  return 1
+}
+
 # ---- 对齐：缺什么补什么（幂等，重复调用结果一致） ----
+# 返回 0 = 地址已在（原本就有，或这次补上了）；返回 1 = 补失败、地址不在。
+# 调用方（reconcile）要拿这个返回值决定「能不能探测」：地址根本不在时 ping 只会报
+# "Cannot assign requested address"，那种失败若被当成证据，会把好前缀误判成死的。
 # 存在性判断走 /proc 的规范十六进制，不做文本比较：
 # `2408:844c:908:a4c4::8888` 与 `2408:844c:0908:a4c4::8888` 是同一个地址，
 # 拿文本去 `ip addr show` 里 grep 会误判成"不存在"，于是每次都白跑一次 ip addr add。
@@ -191,11 +231,12 @@ ensure_addr_from() {
   # 结果地址永远补不上、表面上只剩 "probe failed"，排查了很久。
   OUT=$($IP -6 addr add "${P}${HOSTPART}/64" dev "$IFACE" nodad 2>&1); RC=$?
   if [ "$RC" -eq 0 ]; then
+    date +%s > "$STATE/addr_added_ts"   # 供探测观察期用：地址刚补上时不拿失败当证据
     log "ADD addr ${P}${HOSTPART}"
-  else
-    log "ADD addr FAILED (rc=$RC): $OUT"
+    return 0
   fi
-  return 0
+  log "ADD addr FAILED (rc=$RC): $OUT"
+  return 1
 }
 ensure_route() {
   P=$(cached_prefix)
@@ -238,12 +279,15 @@ drop_self_addr() {
     $IP -6 addr del "$A" dev "$IFACE" 2>/dev/null && log "DEL addr $A"
     $IP -6 route del "$(prefix_of_addr "$A")/64" dev "$IFACE" table "$IFACE" 2>/dev/null
   done
+  rm -f "$STATE/addr_added_ts"
   return 0
 }
 
 # ---- 作废缓存前缀 ----
+# 连带清掉探测证据：前缀都没了，旧前缀上的失败计数不该留给下一个前缀用。
 forget_prefix() {
-  rm -f "$STATE/prefix" "$STATE/prefix_hex" "$STATE/probe_ts"
+  rm -f "$STATE/prefix" "$STATE/prefix_hex" "$STATE/probe_ts" \
+        "$STATE/probe_fail_cnt" "$STATE/probe_fail_since"
   return 0
 }
 
@@ -274,10 +318,17 @@ reconcile() {
   # ② 没有真地址（典型：息屏收不到 RA）→ 用缓存前缀补一个静态地址顶住
   P=$(cached_prefix)
   if [ -n "$P" ]; then
-    ensure_addr_from "$P"
-    # 先补路由再探测：没有默认路由时 ping 连包都发不出去，日志只会是假失败
-    ensure_route
-    probe_report                # 只记录可达性，地址与前缀的去留不受它影响
+    # 只有地址确实在，探测才有意义（补失败时 ping 报的是 "Cannot assign requested address"，
+    # 那种失败不是前缀的证据，不能拿来判死）
+    if ensure_addr_from "$P"; then
+      # 先补路由再探测：没有默认路由时 ping 连包都发不出去，日志只会是假失败
+      ensure_route
+      probe_report              # 只收集可达性证据（单次失败不判决）
+      if ! probe_verdict; then  # 强证据（连续 N 次 + 跨 T 时间）判定前缀已死
+        drop_self_addr          # 宁可不装 IPv6，也不留一个骗 Tailscale 的假地址
+        forget_prefix
+      fi
+    fi
     return 0
   fi
 
