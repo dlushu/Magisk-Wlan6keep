@@ -8,8 +8,9 @@
 #   → 表现为「熄屏一段时间后 IPv6 丢失」。
 #
 # 解决办法：
-#   给 wlan0 维护一个静态全局 IPv6 地址 + 默认路由。静态地址 valid_lft=forever，
-#   不依赖 RA，所以熄屏也不会消失；网络一有变化就把状态重新对齐一次。
+#   主动发送 Router Solicitation 并解析 RA，学到当前路由器发布的全球 /64；
+#   然后给 wlan0 维护一个静态全局 IPv6 地址 + 默认路由。静态地址 valid_lft=forever，
+#   不依赖持续 RA，所以熄屏也不会消失；网络一有变化就把状态重新对齐一次。
 #
 # 重要：静态地址只用「亲眼见过」的前缀，绝不硬编码兜底。
 #   如果 ISP 换了 PD 前缀而模块继续用旧前缀补地址，会得到一个「看起来有 IPv6、
@@ -51,6 +52,10 @@ MONITOR_WINDOW=60                # 单次监听的最长时间（秒）：到点
 PROBE_FAIL_LIMIT=3               # 保守失效判定：连续失败达到这个次数才考虑判死（单次失败绝不判死）
 PROBE_FAIL_WINDOW=900            # 保守失效判定：这串失败还必须跨越这么久（秒），避免踩到一段短时抖动
 ADDR_GRACE=60                    # 地址刚补上后的观察期（秒）：期间探测失败不计入（DAD/路由未就绪）
+RS_COUNT=4                       # 一轮主动发现发送几个 Router Solicitation
+RS_INTERVAL=3s                   # 同一轮内 RS 间隔
+RS_WAIT=20s                      # 一轮主动发现等待 RA 的最长时间
+RS_THROTTLE=300                  # 主动 RS/RA 发现的最小间隔（秒），避免频繁打扰路由器
 
 # KernelSU 用 `ASH_STANDALONE=1 /data/adb/ksu/bin/busybox sh service.sh` 拉起本脚本，
 # 而 busybox sh 的 standalone 模式会**优先命中它自带的 applet**：`ip` 被解析成 busybox 的
@@ -60,6 +65,7 @@ ADDR_GRACE=60                    # 地址刚补上后的观察期（秒）：期
 # 所以这里所有 ip / ping6 一律用绝对路径调用（绝对路径不参与 applet 匹配）。
 IP=/system/bin/ip
 PING6=/system/bin/ping6
+RS6="$MODDIR/bin/rs6-arm64"
 
 # ---------------- 日志 ----------------
 if [ -f "$LOG" ]; then
@@ -151,6 +157,96 @@ learn_gateway() {
   log "learn gateway: $G"
   [ -n "$OLD" ] && return 1    # 旧值非空且不同 → 确实换了网关
   return 0                     # 首次记录（无旧值）→ 不算变化
+}
+
+# ---- 主动发现：发 Router Solicitation，并从 RA 的 PIO 中学习全球 /64 ----
+# 只依赖内核“收到过 RA 后自己生成 dynamic 地址”在 ColorOS 上不够可靠：实测会出现
+# tcpdump/raw socket 已能看到 RA，但 wlan0 长时间不出现 dynamic global address 的情况。
+# rs6-arm64 是本模块自带的小型 arm64 工具：发送标准 ICMPv6 RS，并解析 RA 中的
+# autonomous global /64。学到的仍然只是“当前路由器刚通过 RA 发布的前缀”；之后还要走
+# 既有的公网 ping 验证和连续失败判死，不会因为主动发现而保留假地址。
+prepare_ra_sysctls() {
+  base=/proc/sys/net/ipv6/conf/$IFACE
+  echo 0  > "$base/disable_ipv6" 2>/dev/null
+  echo 2  > "$base/accept_ra" 2>/dev/null
+  echo 1  > "$base/accept_ra_defrtr" 2>/dev/null
+  echo 1  > "$base/accept_ra_pinfo" 2>/dev/null
+  echo 1  > "$base/autoconf" 2>/dev/null
+  echo -1 > "$base/router_solicitations" 2>/dev/null
+}
+
+remember_prefix() {
+  P="$1"
+  H="$2"
+  echo "$P" > "$STATE/prefix"
+  echo "$H" > "$STATE/prefix_hex"
+  rm -f "$STATE/probe_ts" "$STATE/probe_fail_cnt" "$STATE/probe_fail_since"
+  log "remember prefix: $P"
+}
+
+discover_prefix_via_ra() {
+  [ -n "$(real_global_v6)" ] && return 0
+  [ "$(getprop ro.product.cpu.abi 2>/dev/null)" = "arm64-v8a" ] || return 0
+  [ -f "$RS6" ] || return 0
+  chmod 755 "$RS6" 2>/dev/null
+
+  NOW=$(date +%s)
+  LAST=$(cat "$STATE/rs_ts" 2>/dev/null)
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  if [ $((NOW - LAST)) -lt "$RS_THROTTLE" ]; then
+    return 0
+  fi
+  echo "$NOW" > "$STATE/rs_ts"
+  prepare_ra_sysctls
+
+  OUT=$("$RS6" -c "$RS_COUNT" -i "$RS_INTERVAL" -w "$RS_WAIT" "$IFACE" 2>>"$LOG")
+  LINE=$(printf '%s\n' "$OUT" | grep '^RA_PREFIX ' | head -n1)
+  if [ -z "$LINE" ]; then
+    log "active RS: no usable global RA prefix within $RS_WAIT"
+    return 0
+  fi
+
+  NP=$(printf '%s\n' "$LINE" | sed -n 's/^RA_PREFIX prefix=\([^ ]*\)\/64 .*$/\1/p')
+  NH=$(printf '%s\n' "$LINE" | sed -n 's/^.* prefix_hex=\([0-9a-fA-F][0-9a-fA-F]*\).*$/\1/p')
+  RG=$(printf '%s\n' "$LINE" | sed -n 's/^.* router=\([^ ]*\).*$/\1/p')
+  case "$RG" in
+    fe[89abAB][0-9a-fA-F]:*) ;;
+    *) RG="" ;;
+  esac
+  case "$NP" in
+    2*:*::|3*:*::) ;;
+    *) log "active RS: ignore malformed RA prefix: $NP"; return 0 ;;
+  esac
+  case "$NH" in
+    *[!0-9a-fA-F]*) NH="" ;;
+  esac
+  [ "${#NH}" -eq 16 ] || { log "active RS: ignore RA prefix with bad hex: $LINE"; return 0; }
+
+  OLDGW=$(cat "$STATE/gateway" 2>/dev/null)
+  if [ -n "$RG" ] && [ "$RG" != "$OLDGW" ]; then
+    echo "$RG" > "$STATE/gateway"
+    if [ -n "$OLDGW" ]; then
+      log "active RS: RA router changes $OLDGW -> $RG"
+    else
+      log "active RS: RA router $RG"
+    fi
+  fi
+
+  OLD=$(cached_prefix)
+  OLDH=$(cached_prefix_hex)
+  if [ "$NP" = "$OLD" ] && [ "$NH" = "$OLDH" ]; then
+    log "active RS: RA confirms prefix $NP"
+    return 0
+  fi
+
+  if [ -n "$OLD" ]; then
+    log "active RS: RA changes prefix $OLD -> $NP"
+  else
+    log "active RS: RA discovers prefix $NP"
+  fi
+  drop_self_addr
+  remember_prefix "$NP" "$NH"
+  return 0
 }
 
 # ---- 探测：收集可达性证据（单次失败不判决，只累积证据） ----
@@ -254,18 +350,28 @@ ensure_route() {
 
   [ -z "$G" ] && return 0
 
-  if ! $IP -6 route show default dev "$IFACE" table "$IFACE" 2>/dev/null | grep -q "via $G"; then
-    OUT=$($IP -6 route add default via "$G" dev "$IFACE" table "$IFACE" 2>&1)
-    if [ $? -eq 0 ]; then
-      log "ADD route default via $G (table $IFACE)"
-    else
-      log "ADD route default (table $IFACE) FAILED: $OUT"
+  sync_default_route() {
+    T=$1
+    $IP -6 route show default dev "$IFACE" table "$T" 2>/dev/null \
+      | sed -n 's/^default via \([^ ]*\).*$/\1/p' \
+      | while read -r CUR; do
+          [ -z "$CUR" ] && continue
+          [ "$CUR" = "$G" ] && continue
+          $IP -6 route del default via "$CUR" dev "$IFACE" table "$T" 2>/dev/null \
+            && log "DEL route default via $CUR (table $T)"
+        done
+    if ! $IP -6 route show default dev "$IFACE" table "$T" 2>/dev/null | grep -q "via $G"; then
+      OUT=$($IP -6 route add default via "$G" dev "$IFACE" table "$T" 2>&1)
+      if [ $? -eq 0 ]; then
+        log "ADD route default via $G (table $T)"
+      else
+        log "ADD route default (table $T) FAILED: $OUT"
+      fi
     fi
-  fi
-  if ! $IP -6 route show default dev "$IFACE" 2>/dev/null | grep -q "via $G"; then
-    OUT=$($IP -6 route add default via "$G" dev "$IFACE" 2>&1) \
-      || log "ADD route default (main) FAILED: $OUT"
-  fi
+  }
+
+  sync_default_route "$IFACE"
+  sync_default_route 254
   return 0
 }
 
@@ -287,7 +393,7 @@ drop_self_addr() {
 # 连带清掉探测证据：前缀都没了，旧前缀上的失败计数不该留给下一个前缀用。
 forget_prefix() {
   rm -f "$STATE/prefix" "$STATE/prefix_hex" "$STATE/probe_ts" \
-        "$STATE/probe_fail_cnt" "$STATE/probe_fail_since"
+        "$STATE/probe_fail_cnt" "$STATE/probe_fail_since" "$STATE/rs_ts"
   return 0
 }
 
@@ -315,7 +421,10 @@ reconcile() {
     return 0
   fi
 
-  # ② 没有真地址（典型：息屏收不到 RA）→ 用缓存前缀补一个静态地址顶住
+  # ② 没有真地址（典型：息屏收不到 RA，或内核没有根据 RA 生成 SLAAC 地址）
+  #    先主动发 RS 并直接解析 RA；这可能从“无缓存”恢复，也可能在旧前缀变化时立即切到新前缀。
+  discover_prefix_via_ra
+
   P=$(cached_prefix)
   if [ -n "$P" ]; then
     # 只有地址确实在，探测才有意义（补失败时 ping 报的是 "Cannot assign requested address"，
@@ -332,7 +441,7 @@ reconcile() {
     return 0
   fi
 
-  # ③ 连缓存前缀都没有 → 绝不猜前缀，静待系统给 RA
+  # ③ 主动 RS/RA 也没拿到前缀 → 绝不猜前缀，等待下一轮网络事件或节流窗口后重试
   return 0
 }
 

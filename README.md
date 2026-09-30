@@ -15,10 +15,17 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
 
 ## 解决思路
 
-为 `wlan0` 维护一个**静态全局 IPv6 地址 + 默认路由**：
+v1.2 起分两步：**先主动发现前缀，再用静态地址顶住**。
 
-- 静态地址 `valid_lft = forever`，**不依赖 RA**，所以熄屏也不会消失；
-- 网络一有变化（链路 / 地址 / 路由事件）就把状态重新对齐一次，**秒级自愈**。
+1. **主动 RS/RA 发现**（v1.2 新增）：缓存前缀缺失或作废后，模块不再无限被动等待 RA，
+   而是用自带的 `bin/rs6-arm64` 主动发 **Router Solicitation**，并直接在 raw socket 上
+   **接收/解析 RA** 的 Prefix Information Option，亲眼学到当前路由器发布的全球 `/64` 前缀。
+2. **静态全局 IPv6 地址 + 默认路由**：学到前缀后复用原有的静态地址管理——静态地址
+   `valid_lft = forever`，**不依赖持续 RA**，所以熄屏也不会消失；网络一有变化
+   （链路 / 地址 / 路由事件）就把状态重新对齐一次，**秒级自愈**。
+
+> 主动发现只是"学会前缀"的手段；前缀到底能不能用，仍然由既有的公网 ping 探测与连续
+> 失败判死把关——**主动发现绝不保留假地址**。
 
 ## 逻辑结构（三层，各司其职）
 
@@ -33,11 +40,16 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
               ├─ learn_gateway()    返回「换没换网关」→ 换了就拆地址 + 作废前缀（确定性事件）
               ├─ learn_prefix()     从 /proc 学真前缀（真地址优先，自建地址仅作候补）
               ├─ real_global_v6()   系统已给真地址 → 拆掉多余静态地址，保留缓存 + 补路由
-              ├─ 只能吃缓存前缀     → 补静态地址 + 路由（息屏救场）
+              ├─ discover_prefix_via_ra()  无真地址时主动发 RS、解析 RA
+              │                     ├─ 只在 arm64 + rs6 存在、距上次发现 ≥ RS_THROTTLE 时运行
+              │                     ├─ 只认 RA 中 /64 + A 标志 + 全球单播 + 非零生命期
+              │                     ├─ RA 来源必须是 link-local 路由器（code 0）
+              │                     └─ 学到后写 state/prefix(_hex)，并同步 RA 里的网关
+              ├─ 有缓存前缀         → 补静态地址 + 路由（息屏救场）
               │                     ├─ probe_report()   收集可达性证据（单次失败不判决）
               │                     └─ probe_verdict()  强证据（连续 N 次 + 跨 T 时间）
-              │                                          → 拆地址 + 作废前缀
-              └─ 都没有              → 绝不猜前缀，静待 RA
+              │                                          → 拆地址 + 作废前缀（清 rs_ts）
+              └─ 主动发现也没拿到   → 绝不猜前缀，按 RS_THROTTLE 限速重试
 
 ③ 支撑层   单职责小函数 + 日志
 ```
@@ -75,6 +87,16 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
   地址还在 DAD、系统那条 RA 默认路由已随地址一起消失……），一次误判就删掉好地址、永久忘记
   前缀，从此再不工作。三道护栏：地址刚补上后有 `ADDR_GRACE` 观察期不计入；地址补失败
   （`Cannot assign requested address`）时干脆不探测；探测一旦通过就把证据清零。
+- **主动 RS/RA 发现是"受限且诚实"的**（v1.2）：`bin/rs6-arm64` 是一个静态链接的 arm64 小工具
+  （Go 编写，源码在 `tools/rs6/rs6.go`），用 ICMPv6 raw socket 发标准 RS（源 link-local、
+  目标 `ff02::2`、hlim 255、带 source link-layer address），并自己收 RA、解析 PIO。接受条件
+  故意收得很严：`/64`、A 标志（autonomous）、`2000::/3` 全球单播、valid/preferred 非 0、
+  RA code=0 且来源是 link-local 路由器；`fe80::/10`、ULA、非 64 前缀一律丢弃。一轮只发
+  `RS_COUNT` 个、间隔 `RS_INTERVAL`、最多等 `RS_WAIT`，两轮之间还有 `RS_THROTTLE` 节流，
+  **绝不刷 RS**。收不到合格 RA 就保持「没有 IPv6」的诚实状态并限速重试，仍然不猜前缀。
+- **主动发现学到的网关会收敛默认路由**：RA 的源地址就是当前路由器，发现新前缀时一并写入
+  `state/gateway`；`ensure_route()` 会把接口表（`table wlan0`）与 main 表里指向旧网关的
+  默认路由删掉、再补到新网关，避免换路由器后默认路由指向失效邻居。
 - **不在 `ip addr show` 与 `/proc` 之间比字符串**：两者的 IPv6 文本形式不同（内核会省掉每组的前导零，
   `908` 与 `0908` 是同一个前缀）。早期实现拿"从地址文本反推的前缀"和"从 /proc 分组得到的前缀"
   做等值比较，结果永远不相等，会陷入「删掉 → 补上 → 再删掉」的抖动。
@@ -83,15 +105,27 @@ Android（ColorOS 等）在**屏幕关闭**后会启用 Wi-Fi「挂起优化」�
 
 ## 安装
 
-环境要求：KernelSU（或 Magisk）+ root。
+环境要求：KernelSU（或 Magisk）+ root，**arm64（`arm64-v8a`）** 设备。
+主动 RS/RA 功能依赖随模块分发的 `bin/rs6-arm64`；非 arm64 设备上脚本会自动跳过主动发现，
+其余静态地址逻辑不受影响。
 
 ```sh
 # 方式一：用 KernelSU / Magisk 管理器安装 release 里的 zip
-# 方式二：克隆后自行打包
-zip -r Magisk-Wlan6keep.zip module.prop service.sh
+# 方式二：克隆后自行打包（务必带上 bin/，否则主动发现不会运行）
+zip -r Magisk-Wlan6keep.zip module.prop service.sh bin
 ```
 
 安装后**重启生效**（模块在 `late_start` 阶段自动启动）。
+
+### 重新编译 rs6（可选）
+
+设备上不自带 Go，仓库已附带编译好的静态二进制；只有修改 `tools/rs6/rs6.go` 后才需要重新编译：
+
+```sh
+cd tools/rs6
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+  go build -trimpath -ldflags='-s -w' -o ../../bin/rs6-arm64 rs6.go
+```
 
 ## 配置
 
@@ -111,8 +145,13 @@ zip -r Magisk-Wlan6keep.zip module.prop service.sh
 | `PROBE_FAIL_LIMIT` | `3` | 保守失效判定：连续失败达到这个次数才考虑判死（单次失败绝不判死） |
 | `PROBE_FAIL_WINDOW` | `900` | 保守失效判定：这串失败还必须跨越这么久（秒），避免踩到一段短时抖动 |
 | `ADDR_GRACE` | `60` | 地址刚补上后的观察期（秒）：期间探测失败不计入（DAD / 路由未就绪） |
+| `RS_COUNT` | `4` | 一轮主动发现发送的 Router Solicitation 个数 |
+| `RS_INTERVAL` | `3s` | 同一轮内 RS 的发送间隔（Go duration） |
+| `RS_WAIT` | `20s` | 一轮主动发现等待 RA 的最长时间（Go duration，需小于 `MONITOR_WINDOW`） |
+| `RS_THROTTLE` | `300` | 两轮主动发现之间的最小间隔（秒），防止频繁打扰路由器 |
 
-不再有 `PREFIX_DEFAULT` / `GW_DEFAULT`：前缀只从系统学到，学不到就不补地址。
+不再有 `PREFIX_DEFAULT` / `GW_DEFAULT`：前缀要么从系统动态地址学到，要么由主动 RS/RA 学到，
+都学不到就不补地址。
 前缀作废有两条判据：**网关变化**（确定性事件，立刻作废）与**保守失效判定**（连续
 `PROBE_FAIL_LIMIT` 次探测失败且跨越 `PROBE_FAIL_WINDOW`，见「关键设计点」）。
 
@@ -133,11 +172,20 @@ ip -6 route show table wlan0
 了新的前缀/网关；`probe ok` / `probe failed` 记可达性，连续失败会累积证据（`streak n/N`），
 攒够强证据后由 `verdict:` 那条判定前缀已死。
 
+主动发现相关日志：
+
+- `active RS: RA discovers prefix …` / `RA changes prefix A -> B`：从 RA 学到了（新）前缀；
+- `active RS: RA confirms prefix …`：RA 里的前缀与缓存一致；
+- `active RS: RA router …` / `RA router changes A -> B`：从 RA 学到了（新的）路由器；
+- `active RS: no usable global RA prefix within 20s`：本轮没收到合格 RA，保持无 IPv6 状态，
+  最早 `RS_THROTTLE` 秒后重试（**这不是报错**，在组播被固件丢弃的机型上是常态）。
+
 ## 排查：前缀变了，模块没跟上
 
 典型现象：ISP 轮换了 PD 前缀，模块还在用旧前缀补地址，日志里 `probe failed` 反复刷。
-模块现在会自己判定并**诚实退回「没有 IPv6」**，但**不会自动学会新前缀**（原因见「已知边界」），
-所以这一步的目标是人工把新前缀喂给它。
+v1.2 起，模块判死旧前缀后会**主动发 RS、解析 RA 自动学回新前缀**（最早下一个收敛周期，
+失败则按 `RS_THROTTLE` 重试）。在组播被 Wi-Fi 固件丢弃的机型上 RA 可能始终收不到
+（原因见「已知边界」），此时再按下述方法**人工 seed** 作为兜底。
 
 ```sh
 # ① 看日志：probe failed 反复出现 = 典型的假地址（旧前缀）
@@ -146,10 +194,12 @@ su -c 'tail -20 /data/adb/modules/wlan6keep/run.log'
 # ② 看内核有没有收到过 RA：为空 = 内核从没收到 RA（本类机型的常态）
 su -c 'ip -6 route show | grep "proto ra"'
 
-# ③ 手机侧催一次 RS 并抓包（两个窗口）
+# ③ 直接用模块自带的 rs6 手动发一轮 RS 并等 RA（成功会打印 RA_PREFIX …）
+su -c '/data/adb/modules/wlan6keep/bin/rs6-arm64 -c 4 -i 3s -w 20s wlan0'
+# 也可以抓包对照（两个窗口）
 su -c 'tcpdump -i wlan0 -n -e icmp6'                       # 窗口 A
 su -c 'echo 1 > /proc/sys/net/ipv6/conf/wlan0/disable_ipv6; \
-       sleep 3; echo 0 > /proc/sys/net/ipv6/conf/wlan0/disable_ipv6'   # 窗口 B：催 RS
+       sleep 3; echo 0 > /proc/sys/net/ipv6/conf/wlan0/disable_ipv6'   # 窗口 B：催内核 RS
 # 手机侧看不到 RA（连组播都没有）→ 看 ④
 
 # ④ 确认是「组播被 Wi-Fi 固件丢掉」而不是路由器没发
@@ -159,8 +209,8 @@ su -c 'dumpsys wifi | grep -i multicast'   # Multicast Locks held: 为空
 # 应能看到 RA 正带着新前缀发往 ff02::1
 ```
 
-**人工 seed 新前缀**（当前唯一可行的恢复路径）：模块会在下个事件周期（≤ `MONITOR_WINDOW` 60 秒）
-自己把地址补上。
+**人工 seed 新前缀**（主动发现收不到 RA 时的兜底恢复路径）：模块会在下个事件周期
+（≤ `MONITOR_WINDOW` 60 秒）自己把地址补上。
 
 ```sh
 # state/prefix      = 前缀的文本形式，每组补足 4 位、以 :: 结尾
@@ -194,15 +244,18 @@ su -c 'grep -c "monitor: RTM_NEWROUTE" /data/adb/tailscale/run/tailscaled.log'
 - 熄屏时系统的挂起优化依然存在（SLAAC 地址照旧会丢），模块只是用**静态地址**顶住；
 - **外部主动访问手机**：当对端邻居缓存过期、需要重新做 NDP 时可能失败（对方发的是组播 NS）；
   手机**主动出站**不受影响；
-- **换前缀后不会自动学回新前缀**：网关变化或保守失效判定会拆掉静态地址并作废前缀，但此后
-  必须重新学到新前缀才能恢复，而「学到」依赖系统收到 RA —— 本机收不到 RA（见下条），
-  所以实际只能人工 seed。模块也**没有可用的催 RA 路径**：Android 上无 `ndisc6`/`rdisc6`
-  （`disable_ipv6` 1→0 能逼内核发 RS，实测路由器也立刻回了 RA，但回的是组播，本机收不到）。
-  这是当前最大短板；
-- **同一路由器换 PD 前缀：会诚实地退回「没有 IPv6」，但不会自动学回**：网关没变时，靠
-  「连续 N 次探测失败 + 跨 T 时间」的保守失效判定拆地址、作废前缀（见「关键设计点」），
-  而不是继续拿旧前缀糊一个假地址。恢复正常仍需 RA 或人工 seed；
-- **有些机型收不到任何 IPv6 组播，因而永远学不到 RA**（真机实测：一加 PLC110 / ColorOS）。
+- **换前缀后会尽力自动学回，但不保证成功**（v1.2）：网关变化或保守失效判定会拆掉静态地址并
+  作废前缀（同时清 `state/rs_ts`），随后 `discover_prefix_via_ra()` 主动发 RS、自己收 RA 解析
+  PIO——**收到合格 RA 就能自动恢复**，无需人工介入。但本机的 RA 接收是**间歇性**的（见下条），
+  实测同一位置多轮测试既有「RS 后路由器立刻回 RA、工具成功解析」的记录，也有「连续十几个 RS、
+  等一两分钟 0 个 RA」的记录；收不到时模块只按 `RS_THROTTLE` 限速重试并保持诚实的无 IPv6 状态，
+  此时仍可用人工 seed 兜底（步骤见上一节）。Android 没有 `ndisc6`/`rdisc6`，RS 由自带的
+  `bin/rs6-arm64` 发出（SELinux Enforcing 下 root 可正常创建 ICMPv6 raw socket，已实测）；
+- **同一路由器换 PD 前缀**：网关没变时，靠「连续 N 次探测失败 + 跨 T 时间」的保守失效判定
+  拆地址、作废前缀（见「关键设计点」），而不是继续拿旧前缀糊一个假地址；之后同样先尝试主动
+  RS/RA 自动学回，失败再人工 seed；
+- **内核几乎学不到 RA（组播在进内核前被丢），但主动恢复仍有机会**（真机实测：一加 PLC110 /
+  ColorOS，Android 16）。
   2026-09-29 在手机侧与路由器侧**同时抓包**定位到的事实：
 
   - 路由器**一直在正确通告新前缀**：每 10~25 秒一次，源 `fe80::…`，目标 `ff02::1`，
@@ -216,8 +269,11 @@ su -c 'grep -c "monitor: RTM_NEWROUTE" /data/adb/tailscale/run/tailscaled.log'
   - 同一台 AP 上另一台无线客户端能正常 SLAAC 到该前缀 ⇒ **不是 AP、也不是路由器的问题**，
     是这台手机自己的 Wi-Fi 栈。
 
-  结论：这类机型**永远学不到 RA**，不会有 SLAAC 地址，静态地址是唯一的 IPv6 来源，
-  代价是前缀**只能靠缓存**（ISP 换前缀后要人工 seed，步骤见下节）。自查：
+  结论：内核 SLAAC 在这类机型上长期不出现，**静态地址仍是 IPv6 的主要来源**。但
+  2026-09-30 的 rs6 实测表明 RA 接收并非绝对为 0：标准 RS（hlim 255、带源链路层地址选项）
+  发出后，抓包曾多次看到路由器**立即回应**带全球 `/64` 与 A 标志的 RA——只是接收呈间歇性，
+  另一些时段连续多个 RS 也等不到任何 RA。因此 v1.2 的主动恢复是**尽力而为**：一旦碰巧收到
+  合格 RA 即自动学回，否则限速重试并保留人工 seed 兜底。自查：
   `su -c 'ip -s link show wlan0'` 看 `mcast` 是否长期为 0，或
   `su -c 'dumpsys wifi | grep -i multicast'` 看是否没持有 MulticastLock；
 - **「让路由器用单播回 RA」在本拓扑下走不通**（2026-09-29 查证）：单播 RA 只有 odhcpd 的
