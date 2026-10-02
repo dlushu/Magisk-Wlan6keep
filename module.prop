@@ -1,6 +1,6 @@
 id=wlan6keep
 name=WiFi IPv6 Keepalive
-version=v1.2
-versionCode=3
+version=v1.2.1
+versionCode=4
 author=dd
 description=熄屏也能保住 Wi-Fi 的 IPv6。主动发送 Router Solicitation 并解析 RA 学习当前全球 /64；ColorOS 熄屏后会开启 Wi-Fi 挂起优化并丢弃组播帧，导致 RA/NDP 失效、SLAAC 地址过期消失。模块为 wlan0 维护经过公网探测验证的静态全局 IPv6 地址与默认路由（地址永不过期），并用 ip monitor 监听地址/路由变化即时自愈。

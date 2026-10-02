@@ -206,21 +206,24 @@ discover_prefix_via_ra() {
     return 0
   fi
 
-  NP=$(printf '%s\n' "$LINE" | sed -n 's/^RA_PREFIX prefix=\([^ ]*\)\/64 .*$/\1/p')
   NH=$(printf '%s\n' "$LINE" | sed -n 's/^.* prefix_hex=\([0-9a-fA-F][0-9a-fA-F]*\).*$/\1/p')
   RG=$(printf '%s\n' "$LINE" | sed -n 's/^.* router=\([^ ]*\).*$/\1/p')
   case "$RG" in
     fe[89abAB][0-9a-fA-F]:*) ;;
     *) RG="" ;;
   esac
-  case "$NP" in
-    2*:*::|3*:*::) ;;
-    *) log "active RS: ignore malformed RA prefix: $NP"; return 0 ;;
-  esac
   case "$NH" in
     *[!0-9a-fA-F]*) NH="" ;;
   esac
   [ "${#NH}" -eq 16 ] || { log "active RS: ignore RA prefix with bad hex: $LINE"; return 0; }
+  case "$NH" in
+    2*|3*) ;;                       # 2000::/3 全球单播
+    *) log "active RS: ignore non-global RA prefix: $NH"; return 0 ;;
+  esac
+  # 前缀文本统一成 /proc 的补零形式：rs6 的 Go net.IP.String() 会省略每组前导零（...90c...），
+  # 而 learn_prefix() 从 /proc 得到的是补零形式（...090c...）。二者是同一个前缀，若按文本
+  # 比对就会被误判成「换前缀」，从而每个 RS 周期都删地址再补地址（持续抖动）。
+  NP=$(printf '%s' "$NH" | sed 's/\(....\)/\1:/g; s/:$//; s/$/::/')
 
   OLDGW=$(cat "$STATE/gateway" 2>/dev/null)
   if [ -n "$RG" ] && [ "$RG" != "$OLDGW" ]; then
@@ -234,7 +237,7 @@ discover_prefix_via_ra() {
 
   OLD=$(cached_prefix)
   OLDH=$(cached_prefix_hex)
-  if [ "$NP" = "$OLD" ] && [ "$NH" = "$OLDH" ]; then
+  if [ "$NH" = "$OLDH" ]; then          # 前缀身份以十六进制为准（文本写法可能不同）
     log "active RS: RA confirms prefix $NP"
     return 0
   fi
